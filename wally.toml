@@ -1,0 +1,11 @@
+[package]
+name = "cocacolarocks19/datasystem"
+description = "A nice and easy datasystem"
+licence = "MIT"
+authors = ["cocacolarocks19"]
+version = "0.0.1"
+registry = "https://github.com/UpliftGames/wally-index"
+realm = "shared"
+exclude = ["rokit.toml"]
+
+[dependencies]
