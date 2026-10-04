@@ -1,59 +1,20 @@
-local DataStoreService = game:GetService("DataStoreService")
+--!strict
 local Players = game:GetService("Players")
-local RunService = game:GetService("RunService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local DataStoreService = game:GetService("DataStoreService")
 
 local Config = require(script.Parent.Config)
+local SaveManager = require(script.Parent.SaveManager)
 
 local server = {}
-local playerDataStore: DataStore? = nil
-local sessionCache: { [Player]: { Data: table, IsLoaded: boolean } } = {}
+local playerDataStore: DataStore
+local sessionCache: { [Player]: { Data: table, IsLoaded: boolean, SessionId: string } } = {}
 local listeners: { [Player]: { (key: string, value: any) -> () } } = {}
+local fetchedPlayers: { [Player]: boolean } = {}
+local loadFailures: { [Player]: boolean } = {}
 local dataRemote: RemoteEvent
-
-local function reconcile(target: table, template: table): table
-	for key, defaultValue in pairs(template) do
-		if target[key] == nil then
-			if typeof(defaultValue) == "table" then
-				target[key] = reconcile({}, defaultValue)
-			else
-				target[key] = defaultValue
-			end
-		elseif typeof(target[key]) == "table" and typeof(defaultValue) == "table" then
-			reconcile(target[key], defaultValue)
-		end
-	end
-	return target
-end
-
-local function sanitizeForDataStore(orig: any): any
-	if typeof(orig) ~= "table" then
-		return orig
-	end
-
-	local copy = {}
-	for k, v in pairs(orig) do
-		if typeof(v) == "function" then
-			continue
-		elseif typeof(v) == "table" then
-			copy[k] = sanitizeForDataStore(v)
-		else
-			copy[k] = v
-		end
-	end
-	return copy
-end
-
-local function retryAsync(action: () -> any): (boolean, any)
-	local success, result
-	for attempt = 1, Config.MaxRetries do
-		success, result = pcall(action)
-		if success then
-			return true, result
-		end
-		task.wait(1)
-	end
-	return false, result
+local function getLockTimeout(): number
+	return math.max(Config.SessionLockTimeout or 120, (Config.AutoSaveInterval or 300) + (Config.AutoSaveStagger or 1) * Players.MaxPlayers + 60)
 end
 
 local function getRemote(): RemoteEvent
@@ -64,6 +25,52 @@ local function getRemote(): RemoteEvent
 		remote.Parent = ReplicatedStorage
 	end
 	return remote
+end
+
+local function deepCopy(original: any): any
+	if type(original) ~= "table" then
+		return original
+	end
+	local copy = {}
+	for k, v in pairs(original) do
+		copy[deepCopy(k)] = deepCopy(v)
+	end
+	return copy
+end
+
+local function reconcile(target: table, template: table)
+	for k, v in pairs(template) do
+		if target[k] == nil then
+			target[k] = deepCopy(v)
+		elseif type(v) == "table" and type(target[k]) == "table" then
+			reconcile(target[k], v)
+		end
+	end
+end
+
+local function migrate(data: table)
+	if type(data._Metadata) ~= "table" then
+		data._Metadata = {}
+	end
+	local targetVersion = (Config.template._Metadata and Config.template._Metadata.Version) or 1
+	local version = tonumber(data._Metadata.Version) or 1
+	while version < targetVersion do
+		local migration = Config.Migrations and Config.Migrations[version]
+		if type(migration) ~= "function" then
+			return false, string.format("Missing migration from version %d", version)
+		end
+		local ok, migrated = pcall(migration, data)
+		if not ok then
+			return false, migrated
+		end
+		if type(migrated) == "table" then
+			data = migrated
+		end
+		version += 1
+		data._Metadata = if type(data._Metadata) == "table" then data._Metadata else {}
+		data._Metadata.Version = version
+	end
+	return true, data
 end
 
 function server.Configure(customConfig: table)
@@ -78,119 +85,190 @@ function server.Configure(customConfig: table)
 	end
 end
 
+function server.WaitForProfile(player: Player)
+	while player.Parent and not (sessionCache[player] and sessionCache[player].IsLoaded) and not loadFailures[player] do
+		task.wait()
+	end
+	if not player.Parent or loadFailures[player] then
+		return nil
+	end
+	return server.getProfile(player)
+end
+
 function server.Init(customConfig: table?)
 	if customConfig then
 		server.Configure(customConfig)
 	end
-
-	playerDataStore = DataStoreService:GetDataStore(Config.DataStoreName)
+	playerDataStore = DataStoreService:GetDataStore(Config.DataStoreName or "PlayerData")
 	dataRemote = getRemote()
 
 	dataRemote.OnServerEvent:Connect(function(player, action)
-		if action == "Fetch" then
+		if action == "Fetch" and not fetchedPlayers[player] then
 			local session = sessionCache[player]
 			if session and session.IsLoaded then
+				fetchedPlayers[player] = true
 				dataRemote:FireClient(player, "InitSync", session.Data)
 			end
 		end
 	end)
 
 	Players.PlayerRemoving:Connect(function(player)
-		server.SavePlayer(player)
+		fetchedPlayers[player] = nil
+		local session = sessionCache[player]
+		if session and session.IsLoaded then
+			local ok, err = SaveManager.SaveAsync(
+				playerDataStore,
+				"Player_" .. player.UserId,
+				session.Data,
+				session.SessionId,
+				getLockTimeout(),
+				Config.MaxRetries or 3,
+				true
+			)
+			if not ok then
+				warn("[DataSystem] Failed to save/release session for " .. player.Name .. ": " .. tostring(err))
+			end
+		end
 		sessionCache[player] = nil
 		listeners[player] = nil
+		loadFailures[player] = nil
+	end)
+
+	game:BindToClose(function()
+		SaveManager.SetClosing(true)
+		local pendingSaves = 0
+		for _, player in ipairs(Players:GetPlayers()) do
+			local session = sessionCache[player]
+			if session and session.IsLoaded then
+				pendingSaves += 1
+				task.spawn(function()
+					local ok, err = SaveManager.SaveAsync(
+						playerDataStore,
+						"Player_" .. player.UserId,
+						session.Data,
+						session.SessionId,
+						getLockTimeout(),
+						Config.MaxRetries or 3,
+						true
+					)
+					if not ok then
+						warn("[DataSystem] Shutdown save failed for " .. player.Name .. ": " .. tostring(err))
+					end
+					pendingSaves -= 1
+				end)
+			end
+		end
+		local start = os.clock()
+		while pendingSaves > 0 and os.clock() - start < 25 do
+			task.wait(0.1)
+		end
 	end)
 
 	Players.PlayerAdded:Connect(function(player)
-		server.LoadPlayer(player)
+		task.spawn(server.LoadPlayer, player)
 	end)
-
 	for _, player in ipairs(Players:GetPlayers()) do
 		if not sessionCache[player] then
-			task.spawn(function()
-				server.LoadPlayer(player)
-			end)
+			task.spawn(server.LoadPlayer, player)
 		end
 	end
 
 	task.spawn(function()
 		while true do
-			task.wait(Config.AutoSaveInterval)
-			for _, player in ipairs(Players:GetPlayers()) do
-				if sessionCache[player] and sessionCache[player].IsLoaded then
+			task.wait(Config.AutoSaveInterval or 300)
+			local activePlayers = Players:GetPlayers()
+			for _, player in ipairs(activePlayers) do
+				local session = sessionCache[player]
+				if session and session.IsLoaded then
 					task.spawn(function()
-						server.SavePlayer(player)
+						local ok, err = SaveManager.SaveAsync(
+							playerDataStore,
+							"Player_" .. player.UserId,
+							session.Data,
+							session.SessionId,
+							getLockTimeout(),
+							Config.MaxRetries or 3,
+							false
+						)
+						if not ok then
+							warn("[DataSystem] Autosave failed for " .. player.Name .. ": " .. tostring(err))
+						end
 					end)
 				end
+				task.wait(Config.AutoSaveStagger or 1)
 			end
-		end
-	end)
-
-	game:BindToClose(function()
-		if RunService:IsStudio() then
-			task.wait(0.5)
-			return
-		end
-
-		local threads = {}
-		for _, player in ipairs(Players:GetPlayers()) do
-			table.insert(
-				threads,
-				task.spawn(function()
-					server.SavePlayer(player)
-				end)
-			)
-		end
-
-		local start = os.clock()
-		while #threads > 0 and (os.clock() - start) < 10 do
-			task.wait(0.1)
 		end
 	end)
 end
 
 function server.LoadPlayer(player: Player)
-	if not playerDataStore then
-		playerDataStore = DataStoreService:GetDataStore(Config.DataStoreName)
+	local key = "Player_" .. player.UserId
+	local sessionId = SaveManager.NewSessionId()
+	local lockTimeout = getLockTimeout()
+	local retryInterval = Config.RejoinCooldown or 5
+	local lockSuccess, rawData
+
+	while player.Parent and not lockSuccess do
+		lockSuccess, rawData = SaveManager.AcquireSessionAsync(
+			playerDataStore, key, sessionId, deepCopy(Config.template), lockTimeout, Config.MaxRetries or 3
+		)
+		if lockSuccess then
+			break
+		end
+		if rawData ~= "Profile is locked by another server" then
+			warn("[DataSystem] Could not load profile for " .. player.Name .. ": " .. tostring(rawData))
+			loadFailures[player] = true
+			return
+		end
+		task.wait(retryInterval)
+	end
+	if not lockSuccess or not player.Parent then
+		return
 	end
 
-	local key = "Player_" .. player.UserId
-	local success, rawData = retryAsync(function()
-		return playerDataStore:GetAsync(key)
-	end)
+	local data = if type(rawData) == "table" then rawData else deepCopy(Config.template)
+	local migrationOk, migrationResult = migrate(data)
+	if not migrationOk then
+		warn("[DataSystem] Migration failed for " .. player.Name .. ": " .. tostring(migrationResult))
+		SaveManager.SaveAsync(playerDataStore, key, data, sessionId, lockTimeout, Config.MaxRetries or 3, true)
+		loadFailures[player] = true
+		return
+	end
+	data = migrationResult
+	reconcile(data, Config.template)
+	data._Metadata.SessionId = sessionId
+	data._Metadata.LockExpiresAt = os.time() + lockTimeout
 
-	local loadedData = (success and rawData) and reconcile(rawData, Config.template)
-		or sanitizeForDataStore(Config.template)
-
-	sessionCache[player] = { Data = loadedData, IsLoaded = true }
-
-	if dataRemote then
-		dataRemote:FireClient(player, "InitSync", loadedData)
+	sessionCache[player] = { Data = data, IsLoaded = true, SessionId = sessionId }
+	loadFailures[player] = nil
+	if dataRemote and player.Parent then
+		dataRemote:FireClient(player, "InitSync", data)
 	end
 end
 
 function server.SavePlayer(player: Player)
 	local session = sessionCache[player]
-	if not session or not session.IsLoaded or not playerDataStore then
-		return
-	end
-
-	local key = "Player_" .. player.UserId
-	local dataToSave = sanitizeForDataStore(session.Data)
-
-	local success, err = retryAsync(function()
-		playerDataStore:SetAsync(key, dataToSave)
-	end)
-
-	if not success then
-		warn("[DataSystem] Failed to save data for " .. player.Name .. ": " .. tostring(err))
+	if session and session.IsLoaded then
+		task.spawn(function()
+			local ok, err = SaveManager.SaveAsync(
+				playerDataStore,
+				"Player_" .. player.UserId,
+				session.Data,
+				session.SessionId,
+				getLockTimeout(),
+				Config.MaxRetries or 3,
+				false
+			)
+			if not ok then
+				warn("[DataSystem] Save failed for " .. player.Name .. ": " .. tostring(err))
+			end
+		end)
 	end
 end
 
 function server.getProfile(player: Player)
 	local init = script.Parent
 	local DataSystem = require(init)
-
 	return DataSystem.CreateProxy(function()
 		local session = sessionCache[player]
 		return session and session.Data or Config.template
@@ -199,19 +277,14 @@ function server.getProfile(player: Player)
 		if not session or not session.IsLoaded then
 			return
 		end
-
 		if typeof(valOrTransform) == "function" then
 			session.Data = valOrTransform(session.Data)
 		else
 			session.Data = valOrTransform
 		end
-
-		-- Replicate to client
 		if dataRemote then
 			dataRemote:FireClient(player, "InitSync", session.Data)
 		end
-
-		-- FIX: Fire all server-side listeners subscribed to this player's session
 		if listeners[player] then
 			for _, callback in ipairs(listeners[player]) do
 				task.spawn(callback, session.Data)
@@ -233,18 +306,20 @@ function server.getProfile(player: Player)
 	end)
 end
 
--- Alias GetSession to getProfile for backwards compatibility
 server.GetSession = server.getProfile
-
 return setmetatable(server, {
 	__call = function(_, player: Player)
 		return server.getProfile(player)
 	end,
 	__index = function(t, key)
-		-- Allows indexing a Player object directly: Data[player]
 		if typeof(key) == "Instance" and key:IsA("Player") then
 			return server.getProfile(key)
 		end
 		return rawget(t, key)
 	end,
 })
+
+
+
+
+

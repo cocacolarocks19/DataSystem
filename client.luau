@@ -4,6 +4,16 @@ local client = {}
 local localData = {}
 local listeners = {}
 
+local function freezeDeep(value: any): any
+	if type(value) ~= "table" or table.isfrozen(value) then
+		return value
+	end
+	for _, child in pairs(value) do
+		freezeDeep(child)
+	end
+	return table.freeze(value)
+end
+
 local function getRemote(): RemoteEvent?
 	return ReplicatedStorage:WaitForChild("DataSystemSync", 10) :: RemoteEvent?
 end
@@ -11,12 +21,13 @@ end
 function client.Init()
 	local remote = getRemote()
 	if not remote then
+		warn("[DataSystem] DataSystemSync remote was not found; client data will not sync")
 		return
 	end
 
 	remote.OnClientEvent:Connect(function(action, data)
-		if action == "InitSync" then
-			localData = data
+		if action == "InitSync" and type(data) == "table" then
+			localData = freezeDeep(data)
 			for _, callback in ipairs(listeners) do
 				task.spawn(callback, localData)
 			end
@@ -29,7 +40,6 @@ end
 function client.GetProxy()
 	local init = script.Parent
 	local DataSystem = require(init)
-
 	return DataSystem.CreateProxy(function()
 		return localData
 	end, function()
