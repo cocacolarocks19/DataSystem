@@ -1,5 +1,3 @@
-local RunService = game:GetService("RunService")
-
 local DataSystem = {}
 local Types = require(script.Types)
 
@@ -11,89 +9,170 @@ export type Disconnectable = Types.Disconnectable
 DataSystem.server = require(script.server)
 DataSystem.client = require(script.client)
 
+local function deepCopy(value: any): any
+	if type(value) ~= "table" then
+		return value
+	end
+	local copy = {}
+	for key, child in pairs(value) do
+		copy[deepCopy(key)] = deepCopy(child)
+	end
+	return copy
+end
+
 local function createProxy(getValueFn, setValueFn, subscribeFn)
 	local proxy = {}
 	local meta = {}
 
-	-- Getter/Setter Call Syntax: data.Gold() or data.Gold(100) or data.Gold(function(c) return c + 1 end)
+	-- Calling a proxy reads a value or sets it: data.Gold() / data.Gold(100).
+	-- Tables are copied so callers cannot mutate the stored profile by reference.
 	meta.__call = function(_, newValue)
 		if newValue ~= nil then
 			local current = getValueFn()
-			local resolved = typeof(newValue) == "function" and newValue(current) or newValue
+			local resolved
+			if typeof(newValue) == "function" then
+				resolved = newValue(deepCopy(current))
+			else
+				resolved = newValue
+			end
 
-			-- Sanity guard example: Prevent numbers from dropping below 0
 			if typeof(resolved) == "number" and resolved < 0 then
 				warn("[DataSystem] Attempted to set negative value, clamping to 0")
 				resolved = 0
 			end
 
-			setValueFn(resolved)
-			return resolved
-		else
-			return getValueFn()
+			local storedValue = deepCopy(resolved)
+			setValueFn(storedValue)
+			return deepCopy(storedValue)
 		end
+		return deepCopy(getValueFn())
+	end
+
+	meta.__len = function()
+		local current = getValueFn()
+		return type(current) == "table" and #current or 0
+	end
+
+	-- Luau generalized iteration: for index, value in data.Inventory do
+	-- Iterate over a snapshot so callers cannot mutate stored tables by reference.
+	meta.__iter = function()
+		local current = getValueFn()
+		local snapshot = type(current) == "table" and deepCopy(current) or {}
+		local arrayLength = #snapshot
+		if arrayLength > 0 then
+			local index = 0
+			return function()
+				index += 1
+				if index <= arrayLength then
+					return index, snapshot[index]
+				end
+			end
+		end
+		return next, snapshot, nil
 	end
 
 	meta.__index = function(_, key)
-		-- Signal Connection
 		if key == "changed" then
 			return {
 				Connect = function(_, callback)
 					return subscribeFn(callback)
 				end,
 			}
-		-- Array Method: insert(item, pos?)
-		elseif key == "insert" then
-			return function(item, pos: number?)
+		elseif key == "length" then
+			return function()
 				local current = getValueFn()
-				if typeof(current) == "table" then
-					local updated = table.clone(current)
-					if pos then
-						table.insert(updated, pos, item)
-					else
-						table.insert(updated, item)
-					end
-					setValueFn(updated)
-				end
+				return type(current) == "table" and #current or 0
 			end
-		-- Array Method: remove(pos?)
-		elseif key == "remove" then
-			return function(pos: number?)
+		elseif key == "get" then
+			return function(index: number)
 				local current = getValueFn()
-				if typeof(current) == "table" then
-					local updated = table.clone(current)
-					local index = pos or #updated
-					local removed = table.remove(updated, index)
-					setValueFn(updated)
-					return removed
+				if type(current) == "table" and typeof(index) == "number" then
+					return deepCopy(current[index])
+				end
+				return nil
+			end
+		elseif key == "set" then
+			return function(index: number, value: any)
+				local current = getValueFn()
+				if type(current) ~= "table" or typeof(index) ~= "number" or index % 1 ~= 0 or index < 1 or index > #current then
+					warn("[DataSystem] Array set index is out of range")
+					return
+				end
+				local updated = table.clone(current)
+				updated[index] = deepCopy(value)
+				setValueFn(updated)
+			end
+		elseif key == "insert" or key == "push" then
+			return function(item, index: number?)
+				local current = getValueFn()
+				if type(current) ~= "table" then
+					warn("[DataSystem] insert/push can only be used on array data")
+					return nil
+				end
+				local updated = table.clone(current)
+				if key == "push" or index == nil then
+					table.insert(updated, deepCopy(item))
+				else
+					if typeof(index) ~= "number" or index % 1 ~= 0 or index < 1 or index > #updated + 1 then
+						warn("[DataSystem] Array insert index is out of range")
+						return nil
+					end
+					table.insert(updated, index, deepCopy(item))
+				end
+				setValueFn(updated)
+				return #updated
+			end
+		elseif key == "remove" or key == "pop" then
+			return function(index: number?)
+				local current = getValueFn()
+				if type(current) ~= "table" then
+					warn("[DataSystem] remove/pop can only be used on array data")
+					return nil
+				end
+				local removeIndex = if key == "pop" then #current else (index or #current)
+				if typeof(removeIndex) ~= "number" or removeIndex % 1 ~= 0 or removeIndex < 1 or removeIndex > #current then
+					return nil
+				end
+				local updated = table.clone(current)
+				local removed = table.remove(updated, removeIndex)
+				setValueFn(updated)
+				return deepCopy(removed)
+			end
+		elseif key == "clear" then
+			return function()
+				local current = getValueFn()
+				if type(current) == "table" then
+					setValueFn({})
 				end
 			end
 		end
 
-		-- Child Property Subscripting
+		-- Child property/index proxy. False values must remain readable.
 		return createProxy(function()
 			local current = getValueFn()
-			return typeof(current) == "table" and current[key] or nil
-		end, function(val)
+			if type(current) == "table" then
+				return current[key]
+			end
+			return nil
+		end, function(value)
 			local current = getValueFn()
-			if typeof(current) == "table" then
+			if type(current) == "table" then
 				local updated = table.clone(current)
-				if typeof(val) == "function" then
-					updated[key] = val(current[key])
+				if typeof(value) == "function" then
+					updated[key] = deepCopy(value(deepCopy(current[key])))
 				else
-					updated[key] = val
+					updated[key] = deepCopy(value)
 				end
 				setValueFn(updated)
 			end
 		end, function(callback)
-			local lastVal = nil
+			local lastValue = nil
 			return subscribeFn(function(newTable)
-				if typeof(newTable) == "table" then
-					local childVal = newTable[key]
-					-- Only fire listeners if the specific property changed
-					if childVal ~= lastVal then
-						lastVal = childVal
-						callback(childVal)
+				if type(newTable) == "table" then
+					local childValue = newTable[key]
+					if childValue ~= lastValue then
+						lastValue = childValue
+						callback(deepCopy(childValue))
 					end
 				end
 			end)
@@ -108,3 +187,7 @@ function DataSystem.CreateProxy(getValueFn, setValueFn, subscribeFn)
 end
 
 return DataSystem
+
+
+
+

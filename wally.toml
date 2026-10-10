@@ -3,8 +3,8 @@ name = "cocacolarocks19/datasystem"
 description = "A nice and easy datasystem!"
 licence = "MIT"
 authors = ["cocacolarocks19"]
-version = "0.0.2"
-registry = "https://github.com/cocacolarocks19/DataSystem"
+version = "0.0.3"
+registry = "https://github.com/UpliftGames/wally-index"
 realm = "shared"
 exclude = ["rokit.toml"]
 
